@@ -17,6 +17,11 @@
 #       (정산 결과는 로그 채널에도 함께 남김)
 # - (2) 현황판 조건부 갱신: 활동(work/break) 있으면 1분, 없으면 5분
 # - (3) 버튼(출근/휴식/복귀/퇴근) 누를 때마다 즉시 현황판 업데이트
+#
+# ✅ 이번 패치 핵심(요청사항)
+# - Deadlock 제거: 락을 잡은 상태에서 save_now() 같은 “재락” 호출 금지
+# - defer 표준화: 모든 버튼 콜백 시작에 interaction.response.defer(...)
+# - 응답 후 작업 분리: 로그 전송/현황판 수정은 asyncio.create_task로 응답 이후 처리
 # ------------------------------------------------------------
 
 import os
@@ -115,9 +120,11 @@ def safe_str(s: Any) -> str:
 
 
 # ------------------------------------------------------------
-# ✅ 데이터 저장소 (최적화 핵심)
-# - 프로세스 내에서 JSON을 캐시로 유지하고, 변경 시 즉시 원자적(atomic) 저장
-# - 매 버튼/명령마다 파일을 다시 읽지 않아도 됨(디스크 IO 감소)
+# ✅ 데이터 저장소 (Deadlock-free)
+# - store.lock을 잡은 상태에서 save_now()를 부르면 재락으로 데드락 위험
+# - 따라서:
+#   1) 일반 저장: await store.save_now() (락 내부에서 호출 금지)
+#   2) 락 이미 잡은 상태: store.save_now_locked()
 # ------------------------------------------------------------
 class DataStore:
     def __init__(self, path: str):
@@ -152,14 +159,13 @@ class DataStore:
             self._load_sync()
 
     async def save_now(self):
+        # ✅ 락 밖에서 호출하는 일반 저장
         async with self.lock:
             self._atomic_save_sync()
 
-    async def with_data(self):
-        """
-        async with store.with_data() as data: ... 처럼 쓰기 위한 컨텍스트
-        """
-        return self.lock  # 단순화: lock을 그대로 반환
+    def save_now_locked(self):
+        # ✅ 이미 store.lock을 잡은 상태에서 호출
+        self._atomic_save_sync()
 
 
 store = DataStore(DATA_FILE)
@@ -183,7 +189,7 @@ def ensure_guild(data: Dict[str, Any], guild_id: int) -> Dict[str, Any]:
             "settlement_channel_id": None,
             "last_settlement_week_start": None,
             "users": {},
-            # ✅ 최적화: 마지막으로 만든 임베드 해시(동일하면 edit 생략)
+            # ✅ 최적화: 마지막 임베드 해시(동일하면 edit 생략)
             "dashboard_hash": None,
         }
         data["guilds"][gid] = g
@@ -255,7 +261,7 @@ def has_any_activity(guild_data: Dict[str, Any]) -> bool:
 
 
 # ------------------------------------------------------------
-# ✅ 로그 채널(이벤트/정산 결과) 전송
+# ✅ 로그 채널 전송 (응답 후 task에서 호출 권장)
 # ------------------------------------------------------------
 def make_log(action: str, member: discord.Member, ts: datetime, **fields) -> str:
     base = {
@@ -279,7 +285,7 @@ async def send_to_channel(channel: Optional[discord.TextChannel], content: str):
         pass
 
 
-async def send_log(guild: discord.Guild, guild_data: Dict[str, Any], text: str):
+async def send_log_text(guild: discord.Guild, guild_data: Dict[str, Any], text: str):
     ch_id = guild_data.get("log_channel_id")
     if not ch_id:
         return
@@ -306,7 +312,7 @@ async def send_settlement_message_both(
 
 
 # ------------------------------------------------------------
-# ✅ 대시보드(현황판) - edit 최소화 최적화(해시 비교)
+# ✅ 대시보드(현황판) - edit 최소화(해시 비교)
 # ------------------------------------------------------------
 def build_dashboard_text(guild_data: Dict[str, Any]) -> str:
     now = now_kst()
@@ -513,6 +519,16 @@ async def run_weekly_settlement(guild: discord.Guild, guild_data: Dict[str, Any]
 
 
 # ------------------------------------------------------------
+# ✅ 응답 후 작업(로그/대시보드)을 안전하게 수행하는 헬퍼
+# ------------------------------------------------------------
+def schedule_after_response(coro):
+    try:
+        asyncio.create_task(coro)
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------
 # ✅ 버튼 UI(View) - persistent
 # ------------------------------------------------------------
 class StudyView(discord.ui.View):
@@ -524,19 +540,23 @@ class StudyView(discord.ui.View):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return
 
-        async with await store.with_data():
+        # ✅ 3초 제한 회피: 먼저 defer
+        await interaction.response.defer(ephemeral=True)
+
+        now = now_kst()
+        need_after = {"log": None, "update": False}
+
+        async with store.lock:
             data = store.data
             g = ensure_guild(data, interaction.guild.id)
             ensure_week_current(g)
             u = ensure_user(g, interaction.user)
 
-            now = now_kst()
-
             if u.get("status") == "work":
-                await interaction.response.send_message("이미 출근(공부 중) 상태입니다.", ephemeral=True)
+                await interaction.followup.send("이미 출근(공부 중) 상태입니다.", ephemeral=True)
                 return
             if u.get("status") == "break":
-                await interaction.response.send_message("현재 휴식 중입니다. 휴식/복귀 버튼으로 복귀하거나 퇴근하세요.", ephemeral=True)
+                await interaction.followup.send("현재 휴식 중입니다. 휴식/복귀 버튼으로 복귀하거나 퇴근하세요.", ephemeral=True)
                 return
 
             u["status"] = "work"
@@ -544,81 +564,108 @@ class StudyView(discord.ui.View):
             u["break_start"] = None
             u["total_break_today"] = 0
 
-            await store.save_now()
+            store.save_now_locked()
 
-            await send_log(interaction.guild, g, make_log("checkin", interaction.user, now))
-            await update_dashboard(interaction.guild, g, last_actor=interaction.user, force=True)
+            need_after["log"] = make_log("checkin", interaction.user, now)
+            need_after["update"] = True
 
-        await interaction.response.send_message("✅ 출근 완료!", ephemeral=True)
+        # ✅ 응답 먼저
+        await interaction.followup.send("✅ 출근 완료!", ephemeral=True)
+
+        # ✅ 응답 후: 로그/대시보드
+        async def after():
+            async with store.lock:
+                g2 = ensure_guild(store.data, interaction.guild.id)
+            await send_log_text(interaction.guild, g2, need_after["log"])
+            await update_dashboard(interaction.guild, g2, last_actor=interaction.user, force=True)
+
+        schedule_after_response(after())
 
     @discord.ui.button(label="⏸ 휴식/복귀", style=discord.ButtonStyle.secondary, custom_id="study:toggle_break")
     async def toggle_break(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return
 
-        async with await store.with_data():
+        await interaction.response.defer(ephemeral=True)
+
+        now = now_kst()
+        need_after = {"log": None, "update": False}
+        reply = ""
+
+        async with store.lock:
             data = store.data
             g = ensure_guild(data, interaction.guild.id)
             ensure_week_current(g)
             u = ensure_user(g, interaction.user)
 
-            now = now_kst()
             st = u.get("status", "off")
-
             if st == "off":
-                await interaction.response.send_message("출근 후에 사용할 수 있습니다. 먼저 [▶ 출근]을 눌러주세요.", ephemeral=True)
+                await interaction.followup.send("출근 후에 사용할 수 있습니다. 먼저 [▶ 출근]을 눌러주세요.", ephemeral=True)
                 return
 
             if st == "work":
                 u["status"] = "break"
                 u["break_start"] = dt_to_iso(now)
+                store.save_now_locked()
 
-                await store.save_now()
-                await send_log(interaction.guild, g, make_log("break_start", interaction.user, now))
-                await update_dashboard(interaction.guild, g, last_actor=interaction.user, force=True)
+                need_after["log"] = make_log("break_start", interaction.user, now)
+                need_after["update"] = True
+                reply = "⏸ 휴식 시작!"
 
-                await interaction.response.send_message("⏸ 휴식 시작!", ephemeral=True)
-                return
-
-            if st == "break":
+            elif st == "break":
                 bs = iso_to_dt(u.get("break_start"))
-                if bs:
-                    delta = int((now - bs).total_seconds())
-                else:
-                    delta = 0
+                delta = int((now - bs).total_seconds()) if bs else 0
 
                 u["total_break_today"] = int(u.get("total_break_today", 0)) + max(delta, 0)
                 u["status"] = "work"
                 u["break_start"] = None
+                store.save_now_locked()
 
-                await store.save_now()
-                await send_log(interaction.guild, g, make_log("break_end", interaction.user, now, break_sec=delta, total_break_today=u.get("total_break_today", 0)))
-                await update_dashboard(interaction.guild, g, last_actor=interaction.user, force=True)
+                need_after["log"] = make_log("break_end", interaction.user, now, break_sec=delta, total_break_today=u.get("total_break_today", 0))
+                need_after["update"] = True
+                reply = f"▶ 복귀 완료! (휴식 {fmt_hhmm(delta)})"
+            else:
+                reply = "알 수 없는 상태입니다."
 
-                await interaction.response.send_message(f"▶ 복귀 완료! (휴식 {fmt_hhmm(delta)})", ephemeral=True)
-                return
+        await interaction.followup.send(reply, ephemeral=True)
 
-            await interaction.response.send_message("알 수 없는 상태입니다.", ephemeral=True)
+        async def after():
+            async with store.lock:
+                g2 = ensure_guild(store.data, interaction.guild.id)
+            if need_after["log"]:
+                await send_log_text(interaction.guild, g2, need_after["log"])
+            if need_after["update"]:
+                await update_dashboard(interaction.guild, g2, last_actor=interaction.user, force=True)
+
+        schedule_after_response(after())
 
     @discord.ui.button(label="⏹ 퇴근", style=discord.ButtonStyle.danger, custom_id="study:checkout")
     async def checkout(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return
 
-        async with await store.with_data():
+        # ✅ 공개 메시지로 마무리할 수 있으니 thinking=True로 defer
+        await interaction.response.defer(thinking=True)
+
+        now = now_kst()
+        studied_sec = 0
+        tier = "🥉 브론즈"
+        streak = 0
+        weekly_total_after = 0
+        log_text = None
+
+        async with store.lock:
             data = store.data
             g = ensure_guild(data, interaction.guild.id)
             ensure_week_current(g)
             u = ensure_user(g, interaction.user)
 
-            now = now_kst()
             st = u.get("status", "off")
-
             if st == "off":
-                await interaction.response.send_message("현재 대기 중입니다. 출근하지 않은 상태에서는 퇴근할 수 없습니다.", ephemeral=True)
+                await interaction.followup.send("현재 대기 중입니다. 출근하지 않은 상태에서는 퇴근할 수 없습니다.", ephemeral=True)
                 return
 
-            # 휴식 중 퇴근 처리(휴식 시간 반영)
+            # 휴식 중 퇴근: 휴식 시간 반영
             if st == "break":
                 bs = iso_to_dt(u.get("break_start"))
                 if bs:
@@ -628,6 +675,7 @@ class StudyView(discord.ui.View):
 
             studied_sec = calc_effective_study_sec(u, now)
             u["weekly_total_sec"] = int(u.get("weekly_total_sec", 0)) + studied_sec
+            weekly_total_after = int(u.get("weekly_total_sec", 0))
 
             today_s = now.date().isoformat()
             yday_s = (now.date() - timedelta(days=1)).isoformat()
@@ -641,43 +689,51 @@ class StudyView(discord.ui.View):
                 u["streak"] = 1
 
             u["last_work_date"] = today_s
-
-            tier = tier_from_weekly(int(u.get("weekly_total_sec", 0)))
             streak = int(u.get("streak", 0))
+            tier = tier_from_weekly(weekly_total_after)
 
-            # 종료
+            # 종료 처리
             u["status"] = "off"
             u["start_time"] = None
             u["break_start"] = None
             u["total_break_today"] = 0
 
-            await store.save_now()
+            store.save_now_locked()
 
-            await send_log(
-                interaction.guild,
-                g,
-                make_log(
-                    "checkout",
-                    interaction.user,
-                    now,
-                    studied_sec=studied_sec,
-                    weekly_total_sec=u.get("weekly_total_sec", 0),
-                    streak=streak,
-                    tier=tier
-                )
+            log_text = make_log(
+                "checkout",
+                interaction.user,
+                now,
+                studied_sec=studied_sec,
+                weekly_total_sec=weekly_total_after,
+                streak=streak,
+                tier=tier
             )
 
-            await update_dashboard(interaction.guild, g, last_actor=interaction.user, force=True)
-
+        # ✅ 응답(공개)
         msg = f"{interaction.user.mention} 수고하셨습니다! 오늘 {fmt_hhmm(studied_sec)} 공부함. (현재 티어: {tier} / 🔥 {streak}일 연속)"
-        await interaction.response.send_message(msg, ephemeral=False)
+        await interaction.followup.send(msg)
+
+        async def after():
+            async with store.lock:
+                g2 = ensure_guild(store.data, interaction.guild.id)
+            if log_text:
+                await send_log_text(interaction.guild, g2, log_text)
+            await update_dashboard(interaction.guild, g2, last_actor=interaction.user, force=True)
+
+        schedule_after_response(after())
 
     @discord.ui.button(label="📊 내 정보", style=discord.ButtonStyle.secondary, custom_id="study:myinfo")
     async def myinfo(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return
 
-        async with await store.with_data():
+        await interaction.response.defer(ephemeral=True)
+
+        now = now_kst()
+        text = ""
+
+        async with store.lock:
             data = store.data
             g = ensure_guild(data, interaction.guild.id)
             ensure_week_current(g)
@@ -688,22 +744,21 @@ class StudyView(discord.ui.View):
             streak = int(u.get("streak", 0))
             st = status_label(u.get("status", "off"))
 
-            now = now_kst()
             current_session = 0
             if u.get("status") in ("work", "break"):
                 current_session = calc_effective_study_sec(u, now)
 
-        info = (
-            f"**이름:** {u.get('name', interaction.user.display_name)}\n"
-            f"**현재 상태:** {st}\n"
-            f"**이번 주 누적:** {fmt_hhmm(weekly_sec)}\n"
-            f"**현재 티어:** {tier}\n"
-            f"**연속 출근:** 🔥 {streak}일\n"
-        )
-        if current_session > 0:
-            info += f"**현재 세션 실공부:** {fmt_hhmm(current_session)}\n"
+            text = (
+                f"**이름:** {u.get('name', interaction.user.display_name)}\n"
+                f"**현재 상태:** {st}\n"
+                f"**이번 주 누적:** {fmt_hhmm(weekly_sec)}\n"
+                f"**현재 티어:** {tier}\n"
+                f"**연속 출근:** 🔥 {streak}일\n"
+            )
+            if current_session > 0:
+                text += f"**현재 세션 실공부:** {fmt_hhmm(current_session)}\n"
 
-        await interaction.response.send_message(info, ephemeral=True)
+        await interaction.followup.send(text, ephemeral=True)
 
 
 # ------------------------------------------------------------
@@ -714,30 +769,41 @@ async def install_panel(ctx: commands.Context):
     if not ctx.guild:
         return
 
-    async with await store.with_data():
+    # 설치는 상호작용이 아니므로 defer 불필요
+    async with store.lock:
         data = store.data
         g = ensure_guild(data, ctx.guild.id)
         ensure_week_current(g)
 
         old = await fetch_panel_message(ctx.guild, g)
         if old:
-            await send_to_channel(ctx.channel if isinstance(ctx.channel, discord.TextChannel) else None,
-                                 "이미 이 서버에 현황판이 설치되어 있습니다. (기존 메시지를 사용 중)")
+            # 권한 부족으로 reply가 실패했던 적이 있어 안전하게 send
+            try:
+                await ctx.send("이미 이 서버에 현황판이 설치되어 있습니다. (기존 메시지를 사용 중)")
+            except Exception:
+                pass
             return
 
         embed = build_dashboard_embed(ctx.guild, g)
         try:
             msg = await ctx.send(embed=embed, view=StudyView())
         except discord.Forbidden:
+            try:
+                await ctx.send("봇에 메시지 보내기/임베드/버튼 권한이 없습니다. 채널 권한을 확인해 주세요.")
+            except Exception:
+                pass
             return
 
         g["panel"]["channel_id"] = msg.channel.id
         g["panel"]["message_id"] = msg.id
         g["dashboard_hash"] = dashboard_hash(build_dashboard_text(g))
 
-        await store.save_now()
+        store.save_now_locked()
 
-    await ctx.send("✅ 스터디 현황판을 설치했습니다!")
+    try:
+        await ctx.send("✅ 스터디 현황판을 설치했습니다!")
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------
@@ -756,11 +822,11 @@ async def set_log_channel(ctx: commands.Context, channel_arg: str):
         await ctx.send("채널을 찾지 못했습니다. `!로그채널설정 #채널`처럼 채널 멘션으로 입력해 주세요.")
         return
 
-    async with await store.with_data():
+    async with store.lock:
         data = store.data
         g = ensure_guild(data, ctx.guild.id)
         g["log_channel_id"] = ch.id
-        await store.save_now()
+        store.save_now_locked()
 
     await ctx.send(f"✅ 로그 채널이 설정되었습니다: {ch.mention}\n이제 출근/휴식/복귀/퇴근 이벤트가 모두 기록됩니다.")
 
@@ -778,11 +844,11 @@ async def set_settlement_channel(ctx: commands.Context, channel_arg: str):
         await ctx.send("채널을 찾지 못했습니다. `!정산채널설정 #채널`처럼 채널 멘션으로 입력해 주세요.")
         return
 
-    async with await store.with_data():
+    async with store.lock:
         data = store.data
         g = ensure_guild(data, ctx.guild.id)
         g["settlement_channel_id"] = ch.id
-        await store.save_now()
+        store.save_now_locked()
 
     await ctx.send(f"✅ 자동 주간정산 채널이 설정되었습니다: {ch.mention}\n(일요일 12:00 KST에 이 채널로 자동 출력)")
 
@@ -805,24 +871,30 @@ async def adjust_time(ctx: commands.Context, member: discord.Member, hours: str)
         return
 
     delta_sec = int(h * 3600)
+    current = "0시간 0분"
 
-    async with await store.with_data():
+    async with store.lock:
         data = store.data
         g = ensure_guild(data, ctx.guild.id)
         ensure_week_current(g)
         u = ensure_user(g, member)
 
         u["weekly_total_sec"] = max(int(u.get("weekly_total_sec", 0)) + delta_sec, 0)
-        await store.save_now()
-
-        await update_dashboard(ctx.guild, g, last_actor=ctx.author if isinstance(ctx.author, discord.Member) else None, force=True)
-
+        store.save_now_locked()
         current = fmt_hhmm(int(u.get("weekly_total_sec", 0)))
 
     await ctx.send(
         f"✅ 시간 정정 완료: {member.display_name} / {fmt_hhmm(abs(delta_sec))} ({'추가' if delta_sec >= 0 else '차감'})\n"
         f"현재 주간 누적: {current}"
     )
+
+    # ✅ 응답 후 대시보드 갱신(필요 시)
+    async def after():
+        async with store.lock:
+            g2 = ensure_guild(store.data, ctx.guild.id)
+        await update_dashboard(ctx.guild, g2, last_actor=ctx.author if isinstance(ctx.author, discord.Member) else None, force=True)
+
+    schedule_after_response(after())
 
 
 # ------------------------------------------------------------
@@ -836,35 +908,56 @@ async def weekly_settlement_cmd(ctx: commands.Context):
         await ctx.send("이 명령어는 관리자만 사용할 수 있습니다.")
         return
 
-    async with await store.with_data():
+    ch: Optional[discord.TextChannel]
+    async with store.lock:
         data = store.data
         g = ensure_guild(data, ctx.guild.id)
-
         ch = get_settlement_channel(ctx.guild, g)
-        if not ch:
-            await ctx.send("정산 메시지를 보낼 채널을 찾지 못했습니다.")
-            return
 
+    if not ch:
+        await ctx.send("정산 메시지를 보낼 채널을 찾지 못했습니다.")
+        return
+
+    # ✅ 정산은 네트워크 작업이 많으므로, 먼저 안내 후 수행
+    await ctx.send("📌 수동 주간정산을 시작합니다...")
+
+    async with store.lock:
+        g = ensure_guild(store.data, ctx.guild.id)
         await run_weekly_settlement(ctx.guild, g, ch)
         g["last_settlement_week_start"] = g.get("week_start")
+        store.save_now_locked()
 
-        await store.save_now()
-        await update_dashboard(ctx.guild, g, last_actor=ctx.author if isinstance(ctx.author, discord.Member) else None, force=True)
+    # 대시보드 갱신
+    async def after():
+        async with store.lock:
+            g2 = ensure_guild(store.data, ctx.guild.id)
+        await update_dashboard(ctx.guild, g2, last_actor=ctx.author if isinstance(ctx.author, discord.Member) else None, force=True)
+
+    schedule_after_response(after())
 
 
 # ------------------------------------------------------------
-# ✅ 자동 주간정산: 일요일 12:00(KST) 정확히 실행
-# - per-minute poll 대신 time-based 스케줄로 최적화
+# ✅ 자동 주간정산: 일요일 12:00(KST)
+# - tasks.loop(time=...)는 매일 해당 시각에 호출되므로, 일요일만 필터
 # ------------------------------------------------------------
 @tasks.loop(time=time(hour=12, minute=0, tzinfo=KST))
 async def auto_weekly_settlement():
-    async with await store.with_data():
-        data = store.data
+    # 준비(봇 ready 보장)
+    if not bot.is_ready():
+        return
 
-        for guild in bot.guilds:
+    # 매일 12:00 호출 → 일요일만 실행
+    if now_kst().weekday() != 6:
+        return
+
+    # 정산은 길드별 순회
+    for guild in bot.guilds:
+        # 채널/데이터를 잠깐만 확보하고 락 해제 → 네트워크 작업은 락 밖에서
+        async with store.lock:
+            data = store.data
             g = ensure_guild(data, guild.id)
-
             ensure_week_current(g)
+
             ws = g.get("week_start")
             if g.get("last_settlement_week_start") == ws:
                 continue
@@ -873,17 +966,21 @@ async def auto_weekly_settlement():
             if not ch:
                 continue
 
-            # ✅ 일요일 12:00에는 정확히 실행됨(weekday 검사)
-            #    tasks.loop(time=...)는 매일 12:00에 호출되므로, 일요일만 걸러야 함
-            if now_kst().weekday() != 6:
-                continue
+        # ✅ 네트워크 작업(메시지 전송)은 락 밖에서
+        async with store.lock:
+            g_live = ensure_guild(store.data, guild.id)
+        await run_weekly_settlement(guild, g_live, ch)
 
-            await run_weekly_settlement(guild, g, ch)
-            g["last_settlement_week_start"] = ws
+        # ✅ 정산 완료 상태 저장
+        async with store.lock:
+            g_save = ensure_guild(store.data, guild.id)
+            g_save["last_settlement_week_start"] = g_save.get("week_start")
+            store.save_now_locked()
 
-            await update_dashboard(guild, g, last_actor=None, force=True)
-
-        await store.save_now()
+        # ✅ 대시보드 갱신
+        async with store.lock:
+            g2 = ensure_guild(store.data, guild.id)
+        await update_dashboard(guild, g2, last_actor=None, force=True)
 
 
 @auto_weekly_settlement.before_loop
@@ -897,35 +994,37 @@ async def before_auto_weekly_settlement():
 # ------------------------------------------------------------
 @tasks.loop(seconds=60)
 async def auto_dashboard_refresh():
-    async with await store.with_data():
+    if not bot.is_ready():
+        return
+
+    # 1) 데이터 스냅샷(락 짧게)
+    async with store.lock:
         data = store.data
-        any_changed = False
-
+        # week 갱신 처리(필요 시)
         for guild in bot.guilds:
             g = ensure_guild(data, guild.id)
+            ensure_week_current(g)
+        # 활동 여부
+        any_active = any(has_any_activity(ensure_guild(data, guild.id)) for guild in bot.guilds)
 
-            if ensure_week_current(g):
-                any_changed = True
+    # 2) 대시보드 업데이트(락을 길게 잡지 않도록 길드별로 짧게)
+    for guild in bot.guilds:
+        async with store.lock:
+            g = ensure_guild(store.data, guild.id)
+        await update_dashboard(guild, g, last_actor=None, force=False)
 
-            # force=False: 해시 같으면 edit 스킵
-            await update_dashboard(guild, g, last_actor=None, force=False)
-
-        if any_changed:
-            await store.save_now()
-
-        # 다음 interval 조절
-        any_active = False
-        for guild in bot.guilds:
-            g = ensure_guild(data, guild.id)
-            if has_any_activity(g):
-                any_active = True
-                break
-
+    # 3) interval 조절
     target_seconds = 60 if any_active else 300
     try:
         auto_dashboard_refresh.change_interval(seconds=target_seconds)
     except Exception:
         pass
+
+    # 4) 저장(week 갱신으로 변경됐을 수 있음)
+    #    update_dashboard에서 해시만 바뀌는 것은 저장 대상이지만,
+    #    이는 UI 최적화용이므로 엄격히 저장하지 않아도 됨. 그래도 반영.
+    async with store.lock:
+        store.save_now_locked()
 
 
 @auto_dashboard_refresh.before_loop
@@ -995,14 +1094,15 @@ async def on_ready():
         auto_weekly_settlement.start()
 
     # 재시작 시 패널 복구(1회) - force=True로 정확히 갱신
-    async with await store.with_data():
-        data = store.data
-        for guild in bot.guilds:
-            g = ensure_guild(data, guild.id)
+    for guild in bot.guilds:
+        async with store.lock:
+            g = ensure_guild(store.data, guild.id)
             ensure_week_current(g)
-            await update_dashboard(guild, g, last_actor=None, force=True)
+        await update_dashboard(guild, g, last_actor=None, force=True)
 
-        await store.save_now()
+    # 저장
+    async with store.lock:
+        store.save_now_locked()
 
     print(f"✅ 로그인 완료: {bot.user} (서버 {len(bot.guilds)}개)")
 
