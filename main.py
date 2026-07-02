@@ -1866,7 +1866,7 @@ async def close_http_session():
 # 실행
 # ------------------------------------------------------------
 if __name__ == "__main__":
-    token = TOKEN.strip() or os.getenv("DISCORD_TOKEN", "").strip()
+    token = TOKEN.strip() or os.getenv("DISCORD_TOKEN", "").strip() or os.getenv("token", "").strip()
     if not token:
         print("⚠ TOKEN이 비어 있습니다. main.py 상단 TOKEN 또는 환경변수 DISCORD_TOKEN을 설정하세요.")
         raise SystemExit(0)
