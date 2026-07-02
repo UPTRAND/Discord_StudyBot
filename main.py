@@ -459,6 +459,60 @@ def build_total_info_text(user: Dict[str, Any], display_name: str, now: datetime
     )
 
 
+def parse_date_arg(raw: str) -> Optional[date]:
+    try:
+        return date.fromisoformat(raw.strip())
+    except Exception:
+        return None
+
+
+def parse_hours_arg(raw: str) -> Optional[int]:
+    try:
+        return int(float(raw) * 3600)
+    except Exception:
+        return None
+
+
+def recompute_lifetime_total(user: Dict[str, Any]):
+    user["lifetime_total_sec"] = sum(int(v) for v in user.get("daily_sec", {}).values())
+
+
+def recompute_weekly_total(user: Dict[str, Any], now: datetime):
+    start = week_start_kst(now.date())
+    total = 0
+    for i in range(7):
+        day_s = (start + timedelta(days=i)).isoformat()
+        total += int(user.get("daily_sec", {}).get(day_s, 0))
+    user["weekly_total_sec"] = total
+
+
+def reset_user_study_data(user: Dict[str, Any]):
+    user["status"] = "off"
+    user["start_time"] = None
+    user["break_start"] = None
+    user["total_break_today"] = 0
+    user["weekly_total_sec"] = 0
+    user["streak"] = 0
+    user["last_work_date"] = None
+    user["daily_sec"] = {}
+    user["daily_break_sec"] = {}
+    user["lifetime_total_sec"] = 0
+    user["best_streak"] = 0
+    user["tier_counts"] = {k: 0 for k in TIER_LABELS}
+
+
+def tier_key_from_arg(raw: str) -> Optional[str]:
+    aliases = {
+        "언랭": "unranked", "unranked": "unranked",
+        "브론즈": "bronze", "bronze": "bronze",
+        "실버": "silver", "silver": "silver",
+        "골드": "gold", "gold": "gold",
+        "다이아": "diamond", "diamond": "diamond",
+        "챌린저": "challenger", "challenger": "challenger",
+    }
+    return aliases.get(raw.strip().lower())
+
+
 def has_any_activity(guild_data: Dict[str, Any]) -> bool:
     for u in guild_data.get("users", {}).values():
         if u.get("status") in ("work", "break"):
@@ -555,26 +609,29 @@ async def send_settlement_message_both(
 
 
 async def send_alert_text(guild: discord.Guild, guild_data: Dict[str, Any], content: str):
-    channel: Optional[discord.TextChannel] = None
+    """사용자용 알림은 패널 채널과 로그 채널에 함께 보낸다."""
+    targets: List[discord.TextChannel] = []
+
+    panel = guild_data.get("panel", {})
+    panel_id = panel.get("channel_id")
+    if panel_id:
+        ch = guild.get_channel(int(panel_id))
+        if isinstance(ch, discord.TextChannel):
+            targets.append(ch)
 
     log_id = guild_data.get("log_channel_id")
     if log_id:
         ch = guild.get_channel(int(log_id))
-        if isinstance(ch, discord.TextChannel):
-            channel = ch
+        if isinstance(ch, discord.TextChannel) and all(t.id != ch.id for t in targets):
+            targets.append(ch)
 
-    if not channel:
-        panel = guild_data.get("panel", {})
-        ch_id = panel.get("channel_id")
-        if ch_id:
-            ch = guild.get_channel(int(ch_id))
-            if isinstance(ch, discord.TextChannel):
-                channel = ch
+    if not targets:
+        fallback = get_settlement_channel(guild, guild_data)
+        if fallback:
+            targets.append(fallback)
 
-    if not channel:
-        channel = get_settlement_channel(guild, guild_data)
-
-    await send_to_channel(channel, content)
+    for channel in targets:
+        await send_to_channel(channel, content)
 
 
 # ------------------------------------------------------------
@@ -750,6 +807,18 @@ def resolve_member_target(guild: discord.Guild, raw: str) -> Optional[discord.Me
         names = [member.name, member.display_name, str(member)]
         if any(name.lower() == lowered for name in names):
             return member
+    return None
+
+
+def resolve_category_channel(guild: discord.Guild, raw: str) -> Optional[discord.CategoryChannel]:
+    raw = raw.strip()
+    if raw.isdigit():
+        ch = guild.get_channel(int(raw))
+        return ch if isinstance(ch, discord.CategoryChannel) else None
+    lowered = raw.lower()
+    for category in guild.categories:
+        if category.name.lower() == lowered:
+            return category
     return None
 
 
@@ -1410,6 +1479,82 @@ async def unset_voice_alert_channel(ctx: commands.Context, *, channel_arg: str):
     await ctx.send(f"✅ 음성방 알림 대상에서 제거했습니다: **{ch.name}**")
 
 
+@bot.command(name="음성알림전체설정")
+async def set_all_voice_alert_channels(ctx: commands.Context):
+    if not ctx.guild:
+        return
+    if not is_admin_ctx(ctx):
+        await ctx.send("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    async with store.lock:
+        g = ensure_guild(store.data, ctx.guild.id)
+        g["monitored_voice_channel_ids"] = [ch.id for ch in ctx.guild.voice_channels]
+        count = len(g["monitored_voice_channel_ids"])
+        store.save_now_locked()
+
+    await ctx.send(f"✅ 서버의 모든 음성채널 {count}개를 알림 대상으로 등록했습니다.")
+
+
+@bot.command(name="음성알림카테고리설정")
+async def set_category_voice_alert_channels(ctx: commands.Context, *, category_arg: str):
+    if not ctx.guild:
+        return
+    if not is_admin_ctx(ctx):
+        await ctx.send("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    category = resolve_category_channel(ctx.guild, category_arg)
+    if not category:
+        await ctx.send("카테고리를 찾지 못했습니다. 카테고리명 또는 카테고리 ID로 입력해주세요.")
+        return
+
+    channels = [ch for ch in category.channels if isinstance(ch, discord.VoiceChannel)]
+    async with store.lock:
+        g = ensure_guild(store.data, ctx.guild.id)
+        ids = {int(cid) for cid in g.setdefault("monitored_voice_channel_ids", [])}
+        before_count = len(ids)
+        ids.update(ch.id for ch in channels)
+        g["monitored_voice_channel_ids"] = list(ids)
+        added = len(ids) - before_count
+        store.save_now_locked()
+
+    await ctx.send(f"✅ **{category.name}** 카테고리의 음성채널 {len(channels)}개를 확인했고, 새로 {added}개를 등록했습니다.")
+
+
+@bot.command(name="음성알림목록")
+async def list_voice_alert_channels(ctx: commands.Context):
+    if not ctx.guild:
+        return
+    if not is_admin_ctx(ctx):
+        await ctx.send("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    async with store.lock:
+        g = ensure_guild(store.data, ctx.guild.id)
+        ids = [int(cid) for cid in g.get("monitored_voice_channel_ids", [])]
+
+    channels = []
+    missing = 0
+    for cid in ids:
+        ch = ctx.guild.get_channel(cid)
+        if isinstance(ch, discord.VoiceChannel):
+            channels.append(f"- {ch.name} ({ch.id})")
+        else:
+            missing += 1
+
+    if not channels:
+        text = "등록된 음성 알림 채널이 없습니다."
+    else:
+        text = "**등록된 음성 알림 채널**\n" + "\n".join(channels[:50])
+        if len(channels) > 50:
+            text += f"\n...외 {len(channels) - 50}개"
+        if missing:
+            text += f"\n삭제되었거나 찾을 수 없는 채널 {missing}개가 설정에 남아 있습니다."
+
+    await ctx.send(text)
+
+
 @bot.command(name="호출")
 async def call_voice_room(ctx: commands.Context, *, target_arg: str):
     if not ctx.guild or not isinstance(ctx.author, discord.Member):
@@ -1521,6 +1666,189 @@ async def weekly_settlement_cmd(ctx: commands.Context):
     async with store.lock:
         g2 = ensure_guild(store.data, ctx.guild.id)
     await update_dashboard(ctx.guild, g2, last_actor=ctx.author if isinstance(ctx.author, discord.Member) else None, force=True)
+
+
+
+# ------------------------------------------------------------
+# ✅ 공부 데이터 백업/초기화/세부 수정
+# ------------------------------------------------------------
+@bot.command(name="공부데이터백업")
+async def backup_study_data(ctx: commands.Context):
+    if not ctx.guild:
+        return
+    if not is_admin_ctx(ctx):
+        await ctx.send("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+    if not os.path.exists(DATA_FILE):
+        await ctx.send("백업할 데이터 파일이 아직 없습니다.")
+        return
+
+    await ctx.send("📦 현재 공부 데이터 백업입니다.", file=discord.File(DATA_FILE, filename="study_data_backup.json"))
+
+
+@bot.command(name="공부데이터초기화")
+async def reset_study_data(ctx: commands.Context, confirm: str = ""):
+    if not ctx.guild:
+        return
+    if not is_admin_ctx(ctx):
+        await ctx.send("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+    if confirm != "확인":
+        await ctx.send("정말 초기화하려면 !공부데이터초기화 확인 을 입력해주세요. 서버 설정은 유지하고 공부 기록만 초기화합니다.")
+        return
+
+    async with store.lock:
+        g = ensure_guild(store.data, ctx.guild.id)
+        for u in g.get("users", {}).values():
+            reset_user_study_data(u)
+        g["week_start"] = week_start_kst(now_kst().date()).isoformat()
+        g["last_settlement_week_start"] = None
+        g["dashboard_hash"] = None
+        g["break_alerts"] = {}
+        g["long_session_alerts"] = {}
+        g["midnight_alerts"] = {}
+        store.save_now_locked()
+
+    async with store.lock:
+        g2 = ensure_guild(store.data, ctx.guild.id)
+    await update_dashboard(ctx.guild, g2, last_actor=ctx.author if isinstance(ctx.author, discord.Member) else None, force=True)
+    await ctx.send("✅ 공부 데이터가 초기화되었습니다. 현황판/로그/정산/음성 알림 설정은 유지했습니다.")
+
+
+@bot.command(name="유저기록보기")
+async def show_user_record(ctx: commands.Context, member: discord.Member):
+    if not ctx.guild:
+        return
+    if not is_admin_ctx(ctx):
+        await ctx.send("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    now = now_kst()
+    async with store.lock:
+        g = ensure_guild(store.data, ctx.guild.id)
+        u = ensure_user(g, member)
+        rollover_active_sessions(g, now)
+        weekly_text = build_weekly_info_text(u, member.display_name, now)
+        total_text = build_total_info_text(u, member.display_name, now)
+        today_text = build_today_summary_text(u, member.display_name, now)
+        store.save_now_locked()
+
+    await ctx.send(f"{today_text}\n\n{weekly_text}\n\n{total_text}")
+
+
+@bot.command(name="기록수정")
+async def edit_study_record(ctx: commands.Context, member: discord.Member, day: str, hours: str):
+    if not ctx.guild:
+        return
+    if not is_admin_ctx(ctx):
+        await ctx.send("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    d = parse_date_arg(day)
+    sec = parse_hours_arg(hours)
+    if not d or sec is None or sec < 0:
+        await ctx.send("사용법: !기록수정 @유저 YYYY-MM-DD 시간  예) !기록수정 @홍길동 2026-07-02 3.5")
+        return
+
+    async with store.lock:
+        g = ensure_guild(store.data, ctx.guild.id)
+        u = ensure_user(g, member)
+        u.setdefault("daily_sec", {})[d.isoformat()] = sec
+        recompute_lifetime_total(u)
+        recompute_weekly_total(u, now_kst())
+        store.save_now_locked()
+        current = fmt_hhmm(sec)
+
+    await ctx.send(f"✅ 공부 기록 수정 완료: {member.display_name} / {d.isoformat()} / {current}")
+
+
+@bot.command(name="휴식수정")
+async def edit_break_record(ctx: commands.Context, member: discord.Member, day: str, hours: str):
+    if not ctx.guild:
+        return
+    if not is_admin_ctx(ctx):
+        await ctx.send("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    d = parse_date_arg(day)
+    sec = parse_hours_arg(hours)
+    if not d or sec is None or sec < 0:
+        await ctx.send("사용법: !휴식수정 @유저 YYYY-MM-DD 시간  예) !휴식수정 @홍길동 2026-07-02 0.5")
+        return
+
+    async with store.lock:
+        g = ensure_guild(store.data, ctx.guild.id)
+        u = ensure_user(g, member)
+        u.setdefault("daily_break_sec", {})[d.isoformat()] = sec
+        store.save_now_locked()
+        current = fmt_hhmm(sec)
+
+    await ctx.send(f"✅ 휴식 기록 수정 완료: {member.display_name} / {d.isoformat()} / {current}")
+
+
+@bot.command(name="연속수정")
+async def edit_streak(ctx: commands.Context, member: discord.Member, days: int):
+    if not ctx.guild:
+        return
+    if not is_admin_ctx(ctx):
+        await ctx.send("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+    if days < 0:
+        await ctx.send("일수는 0 이상이어야 합니다.")
+        return
+
+    async with store.lock:
+        g = ensure_guild(store.data, ctx.guild.id)
+        u = ensure_user(g, member)
+        u["streak"] = days
+        u["best_streak"] = max(int(u.get("best_streak", 0)), days)
+        store.save_now_locked()
+
+    await ctx.send(f"✅ 연속 출근 수정 완료: {member.display_name} / {days}일")
+
+
+@bot.command(name="최고연속수정")
+async def edit_best_streak(ctx: commands.Context, member: discord.Member, days: int):
+    if not ctx.guild:
+        return
+    if not is_admin_ctx(ctx):
+        await ctx.send("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+    if days < 0:
+        await ctx.send("일수는 0 이상이어야 합니다.")
+        return
+
+    async with store.lock:
+        g = ensure_guild(store.data, ctx.guild.id)
+        u = ensure_user(g, member)
+        u["best_streak"] = days
+        store.save_now_locked()
+
+    await ctx.send(f"✅ 최고 연속 출근 수정 완료: {member.display_name} / {days}일")
+
+
+@bot.command(name="티어횟수수정")
+async def edit_tier_count(ctx: commands.Context, member: discord.Member, tier: str, count: int):
+    if not ctx.guild:
+        return
+    if not is_admin_ctx(ctx):
+        await ctx.send("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+    key = tier_key_from_arg(tier)
+    if not key or count < 0:
+        await ctx.send("사용법: !티어횟수수정 @유저 티어 횟수  티어: 언랭/브론즈/실버/골드/다이아/챌린저")
+        return
+
+    async with store.lock:
+        g = ensure_guild(store.data, ctx.guild.id)
+        u = ensure_user(g, member)
+        counts = u.setdefault("tier_counts", {})
+        for k in TIER_LABELS:
+            counts.setdefault(k, 0)
+        counts[key] = count
+        store.save_now_locked()
+
+    await ctx.send(f"✅ 티어 횟수 수정 완료: {member.display_name} / {TIER_LABELS[key]} {count}회")
 
 
 # ------------------------------------------------------------
