@@ -1436,14 +1436,12 @@ async def call_voice_room(ctx: commands.Context, *, target_arg: str):
     if member_target:
         target_place = member_target.voice.channel.name if member_target.voice and member_target.voice.channel else "현재 음성채널 없음"
         content = f"📣 **개인 호출**: **{source}**에서 {member_target.mention}님을 호출했습니다."
-        content += f"
-대상 위치: **{target_place}**"
+        content += f"\n대상 위치: **{target_place}**"
     else:
         mentions = " ".join(m.mention for m in channel_target.members if not m.bot)
         content = f"📣 **방 호출**: **{source}**에서 **{channel_target.name}** 방을 호출했습니다."
         if mentions:
-            content += f"
-{mentions}"
+            content += f"\n{mentions}"
 
     async with store.lock:
         g2 = ensure_guild(store.data, ctx.guild.id)
