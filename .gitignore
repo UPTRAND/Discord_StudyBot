@@ -1,0 +1,13 @@
+# Secrets
+.env
+디코 토큰.txt
+
+# Runtime data
+study_data.json
+study_data.json.tmp
+study_data.json.corrupt.*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
