@@ -1206,13 +1206,10 @@ class MyBot(commands.Bot):
         # 1) 파일 로드(가장 먼저)
         await store.load_once()
 
-        # 2) Health 서버를 Discord ready 이전에 기동
-        self.loop.create_task(start_web_server())
-
-        # 3) persistent view 등록
+        # 2) persistent view 등록
         self.add_view(StudyView())
 
-        # 4) 자동 태스크 시작
+        # 3) 자동 태스크 시작
         if not auto_dashboard_refresh.is_running():
             auto_dashboard_refresh.start()
         if not auto_weekly_settlement.is_running():
@@ -1865,17 +1862,19 @@ async def close_http_session():
 # ------------------------------------------------------------
 # 실행
 # ------------------------------------------------------------
-if __name__ == "__main__":
+async def main():
     token = TOKEN.strip() or os.getenv("DISCORD_TOKEN", "").strip() or os.getenv("token", "").strip()
     if not token:
         print("⚠ TOKEN이 비어 있습니다. main.py 상단 TOKEN 또는 환경변수 DISCORD_TOKEN을 설정하세요.")
         raise SystemExit(0)
 
+    await start_web_server()
     try:
-        bot.run(token)
+        await bot.start(token)
     finally:
-        # best-effort close
-        try:
-            asyncio.run(close_http_session())
-        except Exception:
-            pass
+        await close_http_session()
+        await bot.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
